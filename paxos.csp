@@ -1,0 +1,241 @@
+// no error trace: [if((global_elected_leader == 1))], client_proposer.123, [if!((identifier >= 1))], prepare_channel[0].1, prepare_channel[1].1, prepare_channel[2].1, [if!((prepare_reads < quorums))], reset_prepare_reads, promise_channel[0].PASS, promise_channel[1].PASS, promise_channel[2].PASS, [if!((promise_received < quorums))], reset_promise_count, [if!((terminate == true))], update_global_id, [if((global_accepted_value == -(1)))], accept_channel[0].1.123, accept_channel[1].1.123, accept_channel[2].1.123
+
+// number of nodes
+#define N 8; 
+
+// entities
+#define ACCEPTORS 3;
+#define PROPOSERS 2;
+#define LEARNERS 2;
+
+// message types
+#define PASS 1000;
+#define NACK -99;
+#define FAIL -1000;
+#define INACTIVE -999;
+
+// acceptor states
+var acceptor_prepare_status = [PASS(ACCEPTORS)];
+var acceptor_can_broadcast = [NACK(ACCEPTORS)];
+var acceptor_values = [-1(ACCEPTORS)];
+var acceptor_promised_id = [-1(N)];
+
+// proposer states
+var proposer_status = [PASS(PROPOSERS)];
+
+// global state for proposer
+var global_accepted_value = -1;
+var global_elected_leader = 0;
+var global_terminate = false;
+var global_identifier = 0;
+
+var hasNack = false;
+
+var highest_id = -1;
+var last_accepted = -1;
+
+// client state
+var client_proposed_value = -1;
+var client_read_value = -1;
+var client_consensus = -1;
+
+// for validating quorums
+var quorums = ACCEPTORS / 2 + 1;
+var prepare_reads = 0;
+var promise_received = 0;
+var accept_reads = 0;
+var accepted_received = 0;
+
+// channels
+channel reset[3] 0;
+channel prepare_channel[3] 0;
+channel promise_channel[3] 0;
+channel accepted_channel[2] 0;
+channel accept_channel [3] 0;
+
+channel client_proposer 0;
+channel learner_client 0;
+
+Proposer(i) = 
+	if (global_elected_leader == i) {
+		if (client_proposed_value == -1) {
+			client_proposer?value {
+				client_proposed_value = value
+			} -> Skip 
+		};
+		ProposerState(1, i)
+	} else {
+		Skip
+	};
+
+ProposerState(state, curr) = 
+	if (global_identifier >= state) {
+		ProposerState(global_identifier + 1, curr)
+	} else {
+		SendPrepareMsg(state, curr);
+		if (prepare_reads < quorums) {
+			atomic { ResetPrepareReads() };
+			atomic { (|||a:{0..ACCEPTORS-1}@(reset[a]!FAIL -> Skip)) };
+			ProposerState(state, curr) 
+		} else {
+			ResetPrepareReads();
+			(|||y:{0..ACCEPTORS-1}@(promise_channel[y]?val{
+				if (val == NACK) { global_terminate = true }
+				if (val != INACTIVE && val != FAIL) { promise_received = promise_received + 1 }
+			} -> Skip));
+			if (promise_received < quorums) {
+				atomic { 
+					atomic { ResetPromiseReceived() };
+					atomic { (|||a:{0..ACCEPTORS-1}@(reset[a]!FAIL -> Skip)) }; // TODO: fix the reroute to tgt state 8 problem
+					ProposerState(state, curr) 
+				}
+			} else {
+				atomic { ResetPromiseReceived() };
+				// since we have achieved quorum of acceptors
+				// next request must be larger than current state
+				if (global_terminate) {
+					atomic { (|||a:{0..ACCEPTORS-1}@(reset[a]!FAIL -> Skip)) };
+					ProposerState(state, curr) // retry
+				} else {
+					update_global_id { global_identifier = state } -> Skip; 
+					SendsAcceptMsg(state);
+					if (global_terminate) {
+						atomic { (|||a:{0..ACCEPTORS-1}@(reset[a]!FAIL -> Skip)) };
+						([]i:{0..PROPOSERS-1}@(elect_leader{
+							global_terminate = false
+						} -> Proposer(i)))
+					}
+				}
+			}
+		}
+	};
+	
+SendPrepareMsg(state, curr) = 
+	atomic { |||x:{0..2}@(prepare_channel[x]!curr.state.PASS -> Skip [] prepare_channel[x]!curr.state.FAIL -> Skip) };
+	
+ResetPrepareReads() = 
+	reset_prepare_reads { prepare_reads = 0; } -> Skip;
+
+ResetPromiseReceived() = 
+	reset_promise_count { promise_received = 0 } -> Skip;
+
+// if no value is accepted previously, use the client_proposed_value
+SendsAcceptMsg(state) = 
+	if (global_accepted_value == -1) {
+		// by not making it atomic, this allows next step to be triggered once quorum is achieved.
+		// if atomic, we can only move on once all acceptors have sent their accept.
+		(|||z:{0..ACCEPTORS-1}@accept_channel[z]!state.client_proposed_value -> Skip) 
+		||| ((proposer_fails { 
+			global_terminate = true; 
+			proposer_status[global_elected_leader] = FAIL;
+			global_elected_leader = (global_elected_leader + 1) % PROPOSERS;
+		} -> Skip) [] (proposer_did_not_fail_when_sending_accept -> Skip))
+	} else {
+		(|||z:{0..ACCEPTORS-1}@accept_channel[z]!state.global_accepted_value -> Skip) 
+		||| ((proposer_fails { 
+			global_terminate = true; 
+			proposer_status[global_elected_leader] = FAIL;
+			global_elected_leader = (global_elected_leader + 1) % PROPOSERS;
+		} -> Skip) [] (proposer_did_not_fail_when_sending_accept -> Skip))
+	}; 
+	
+Acceptor(i) = 
+	prepare_channel[i]?curr.state.status { 
+		if (status == FAIL) {
+			// by default, it's true, so we set to fail
+			acceptor_prepare_status[i] = FAIL
+		} else {
+			// retrieve the previous promised id (meaning subsequent id has to be larger than this)
+			var prev_id = acceptor_promised_id[i];
+			// increment # of prepare reads
+			prepare_reads = prepare_reads + 1;
+			// retrive the previous *accepted* value
+			last_accepted = acceptor_values[i];
+			
+			// if acceptor previously already accepted some value, 
+			// and previous promised id is larger than the current highest_id we seen so far
+			// then override the global_accepted_value
+			// this global_accepted_value is the one that the proposer will use
+			// client_proposed_value < global_accepted_value
+			if (last_accepted != -1 && prev_id > highest_id) {
+				highest_id = prev_id;
+				global_accepted_value = last_accepted;
+			}
+			
+			// we dont update the acceptor internal state during the prepare phase
+			// but we still do the check
+			if (prev_id >= state) { 
+				hasNack = true; 
+			} else {
+				acceptor_promised_id[i] = state;
+			}
+		}
+	} -> 
+	(	
+		SendPromise(i);
+		(
+			(	  // after receiving accept message, we need to broadcast the accepted to learners and proposers. TODO: proposers
+				  // valid only if the status of broadcast accepted is PASS
+				  // proposer fails while sending accept, each accept has to be broadcasted if received. need to send values into channel.
+				 (ReceivesAcceptMsg(i); BroadcastAccepted(i)) [] ResetAcceptor(i, true)
+			)
+		) [] ResetAcceptor(i, true)
+	); 
+	if (global_terminate) { ResetAcceptor(i, false) };
+	
+ResetAcceptor(i, clear) = 
+	reset[i]?x {
+		if (clear == true) {
+			acceptor_promised_id[i] = 0; // reset
+			acceptor_prepare_status[i] = PASS;
+			acceptor_can_broadcast[i] = NACK;
+		}
+	} -> Acceptor(i);
+	
+ReceivesAcceptMsg(i) =
+	accept_channel[i]?state.av {
+		if (global_terminate == false) {
+			var currentId = acceptor_promised_id[i];
+			if (state >= currentId) {
+				acceptor_values[i] = av; // update accepted value
+				acceptor_can_broadcast[i] = PASS;
+			}
+		}
+	} -> Skip;
+	
+SendPromise(i) =
+	if (acceptor_prepare_status[i] == FAIL) {
+		promise_channel[i]!INACTIVE-> Skip
+	} else {
+		([hasNack == true] promise_channel[i]!NACK -> Skip) []
+		([hasNack == false] promise_channel[i]!PASS -> Skip) [] 
+		(promise_channel[i]!FAIL -> Skip)
+	};
+	
+BroadcastAccepted(i) = 
+	(|||q:{0..LEARNERS-1}@accepted_channel[q]!acceptor_values[i].acceptor_can_broadcast[i]-> Skip);
+
+Learner(i) =
+	(|||{ACCEPTORS}@(accepted_channel[i]?val.status {
+		if (status == PASS) {
+			client_consensus = val
+		}
+	} -> Skip)); 
+	if (client_consensus == -1) {
+		Learner(i)
+	} else {
+		(learner_client!i.client_consensus -> Learner(i) [] learner_client!i.FAIL -> Learner(i))
+	};
+	
+Client(value) = (
+		client_proposer!value -> Skip;
+		(|||{LEARNERS}@(learner_client?i.x {
+		 	if (x != FAIL) {
+			 	client_read_value = x
+			}
+		} -> Skip));
+		finish { client_consensus = -1 } -> Skip
+	) ;
+
+// entry point
+System = Client(123) || Proposer(0) || (|||x:{0..ACCEPTORS-1}@Acceptor(x)) || (|||y:{0..LEARNERS-1}@Learner(y));
