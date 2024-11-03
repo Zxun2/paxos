@@ -5,6 +5,9 @@ CSP Formalization for Paxos Protocol
 
 ### v0.2-beta
 - Add coverage for when multiple Proposers conflict
+- Add coverage for when new Proposers cannot change an existing consensus
+- Add coverage for when a multi-identifier majority is insufficient
+- Add coverage for when an Acceptor accepts Two Different Values
 - Resolve issue where you can recover before resetting acceptor state
 
 ### v0.1-beta 
