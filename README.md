@@ -2,6 +2,11 @@
 CSP Formalization for Paxos Protocol
 
 ## Changelog
+
+### v0.2-beta
+- Add coverage for when multiple Proposers conflict
+- Resolve issue where you can recover before resetting acceptor state
+
 ### v0.1-beta 
 
 - Add support for multi-proposers
