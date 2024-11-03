@@ -17,8 +17,9 @@
 // acceptor states
 var acceptor_prepare_status = [PASS(ACCEPTORS)];
 var acceptor_can_broadcast = [NACK(ACCEPTORS)];
-var acceptor_values = [-1(ACCEPTORS)];
 var acceptor_promised_id = [-1(N)];
+var acceptor_accept_values = [-1(ACCEPTORS)];
+var acceptor_accept_id = [-1(ACCEPTORS)];
 
 // proposer states
 var proposer_status = [PASS(PROPOSERS)];
@@ -49,24 +50,21 @@ var accepted_received = 0;
 var retry = false;
 
 // channels
-channel reset[3] 0;
-channel prepare_channel[3] 0;
-channel promise_channel[3] 0;
-channel accepted_channel_learner[2] 0;
+channel reset[ACCEPTORS] 0;
+channel prepare_channel[ACCEPTORS] 0;
+channel promise_channel[ACCEPTORS] 0;
+channel accepted_channel_learner[LEARNERS] 0;
 channel accepted_channel_proposer 0;
-channel accept_channel [3] 0;
+channel accept_channel [ACCEPTORS] 0;
 
 channel client_proposer 0;
 channel learner_client 0;
 
 Proposer(state, i) = 
 	if (global_elected_leader == i) {
-		if (client_proposed_value == -1) {
-			client_proposer?value {
-				client_proposed_value = value
-			} -> Skip 
-		};
-		ProposerState(state, i)
+		(client_proposer?value {
+			client_proposed_value = value
+		} -> ProposerState(state, i)) [] ProposerState(state, i)
 	} else {
 		Skip
 	};
@@ -132,10 +130,8 @@ ProposerState(state, curr) =
 						(SendsAcceptMsg(state) |||
 							// 2b. ACCEPTED
 							(|||{ACCEPTORS}@(accepted_channel_proposer?val.status {
-									if (status == PASS) {
-										client_consensus = val;
-										retry = true;
-									}
+									if (status == PASS) { client_consensus = val };
+									if (status == NACK) { retry = true }
 								} -> Skip))); 
 						if (global_terminate) {
 							ElectNewLeader()
@@ -161,7 +157,7 @@ ElectNewLeader() =
 	) ;
 	
 SendPrepareMsg(state, curr) = 
-	atomic { |||x:{0..2}@(prepare_channel[x]!curr.state.PASS -> Skip [] prepare_channel[x]!curr.state.FAIL -> Skip) };
+	atomic { |||x:{0..ACCEPTORS-1}@(prepare_channel[x]!curr.state.PASS -> Skip [] prepare_channel[x]!curr.state.FAIL -> Skip) };
 	
 PreparePhaseEnds() = 
 	prepare_ends { prepare_reads = 0; } -> Skip;
@@ -194,11 +190,11 @@ Acceptor(i) =
 			acceptor_prepare_status[i] = FAIL
 		} else {
 			// retrieve the previous promised id (meaning subsequent id has to be larger than this)
-			var prev_id = acceptor_promised_id[i];
+			var prev_id = acceptor_accept_id[i];
 			// increment # of prepare reads
 			prepare_reads = prepare_reads + 1;
 			// retrive the previous *accepted* value
-			last_accepted = acceptor_values[i];
+			last_accepted = acceptor_accept_values[i];
 			
 			// if acceptor previously already accepted some value, 
 			// and previous promised id is larger than the current highest_id we seen so far
@@ -212,7 +208,7 @@ Acceptor(i) =
 			
 			// we dont update the acceptor internal state during the prepare phase
 			// but we still do the check
-			if (prev_id >= state) { 
+			if (acceptor_promised_id[i] >= state) { 
 				hasNack = true; 
 			} else {
 				acceptor_promised_id[i] = state;
@@ -230,10 +226,9 @@ Acceptor(i) =
 	
 ResetAcceptor(i, clear) = 
 	reset[i]?curr.x {
+		acceptor_can_broadcast[i] = NACK;
+		acceptor_prepare_status[i] = PASS;
 		if (clear == true) {
-//			acceptor_promised_id[i] = 0; // reset
-			acceptor_prepare_status[i] = PASS;
-			acceptor_can_broadcast[i] = NACK;
 			hasNack = false;
 			global_terminate = false;
 			retry = false;
@@ -242,10 +237,12 @@ ResetAcceptor(i, clear) =
 	
 ReceivesAcceptMsg(i) =
 	accept_channel[i]?state.av {
+		accept_reads = accept_reads + 1;
 		if (global_terminate == false) {
 			var currentId = acceptor_promised_id[i];
 			if (state >= currentId) {
-				acceptor_values[i] = av; // update accepted value
+				acceptor_accept_values[i] = av; // update accepted value
+				acceptor_accept_id[i] = state; // update accepted value
 				acceptor_can_broadcast[i] = PASS;
 			} else {
 				retry = true; 
@@ -255,16 +252,16 @@ ReceivesAcceptMsg(i) =
 	
 SendPromise(i) =
 	if (acceptor_prepare_status[i] == FAIL) {
-		promise_channel[i]!acceptor_promised_id[i].acceptor_values[i].INACTIVE-> Skip
+		promise_channel[i]!acceptor_promised_id[i].acceptor_accept_values[i].INACTIVE-> Skip
 	} else {
-		([hasNack == true] promise_channel[i]!acceptor_promised_id[i].acceptor_values[i].NACK -> Skip) []
-		([hasNack == false] promise_channel[i]!acceptor_promised_id[i].acceptor_values[i].PASS -> Skip) [] 
-		(promise_channel[i]!acceptor_promised_id[i].acceptor_values[i].FAIL -> Skip)
+		([hasNack == true] promise_channel[i]!acceptor_promised_id[i].acceptor_accept_values[i].NACK -> Skip) []
+		([hasNack == false] promise_channel[i]!acceptor_promised_id[i].acceptor_accept_values[i].PASS -> Skip) [] 
+		(promise_channel[i]!acceptor_promised_id[i].acceptor_accept_values[i].FAIL -> Skip)
 	};
 	
 BroadcastAccepted(i) = 
-	((|||q:{0..LEARNERS-1}@accepted_channel_learner[q]!acceptor_values[i].acceptor_can_broadcast[i]-> Skip) |||
-	(accepted_channel_proposer!acceptor_values[i].acceptor_can_broadcast[i]-> Skip));
+	((|||q:{0..LEARNERS-1}@accepted_channel_learner[q]!acceptor_accept_values[i].acceptor_can_broadcast[i]-> Skip) |||
+	(accepted_channel_proposer!acceptor_accept_values[i].acceptor_can_broadcast[i]-> Skip));
 
 Learner(i) =
 	(|||{ACCEPTORS}@(accepted_channel_learner[i]?val.status {
@@ -284,7 +281,7 @@ Client(value) = (
 		 	if (x != FAIL) {
 			 	client_read_value = x
 			}
-		} -> Skip));
+		} -> Skip)) interrupt propose_new_value -> Client(value + 1);
 		finish { client_consensus = -1 } -> Skip
 	) ;
 
