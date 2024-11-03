@@ -166,7 +166,7 @@ ResetPromiseReceived() =
 	reset_promise_count { promise_received = 0 } -> Skip;
 
 // if no value is accepted previously, use the client_proposed_value
-SendsAcceptMsg(state) = 
+SendsAcceptMsg(state) =  // an accept message 
 	if (global_accepted_value == -1) {
 		// by not making it atomic, this allows next step to be triggered once quorum is achieved.
 		// if atomic, we can only move on once all acceptors have sent their accept.
@@ -272,15 +272,17 @@ Learner(i) =
 	if (client_consensus == -1) {
 		Learner(i)
 	} else {
-		((learner_client!i.client_consensus -> Learner(i)) [] (learner_client!i.FAIL -> Learner(i)) [] (reset_learner -> Learner(i)))
+		(([accept_reads >= quorums] learner_client!i.client_consensus -> Learner(i)) [] ([accept_reads >= quorums] learner_client!i.FAIL -> Learner(i)) [] (reset_learner -> Learner(i)))
 	};
-	
+
+
 Client(value) = (
 		client_proposer!value -> Skip;
 		(|||{LEARNERS}@(learner_client?i.x {
 		 	if (x != FAIL) {
 			 	client_read_value = x
-			}
+			}       // after proposing a value, you can interrupt and propose a new value
+			        // that way when the next reset point happens you can set a new value
 		} -> Skip)) interrupt propose_new_value -> Client(value + 1);
 		finish { client_consensus = -1 } -> Skip
 	) ;
