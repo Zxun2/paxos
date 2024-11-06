@@ -3,6 +3,9 @@ CSP Formalization for Paxos Protocol
 
 ## Changelog
 
+### v0.3-beta
+- Resolve more bugs
+
 ### v0.2-beta
 - Add coverage for when multiple Proposers conflict
 - Add coverage for when new Proposers cannot change an existing consensus
