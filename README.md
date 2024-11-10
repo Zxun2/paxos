@@ -33,3 +33,7 @@ Notable highlights:
 - Add coverage for when an acceptor fails to send a Promise (quorum achieved)
 - Bug Fixes
 - Better formatting
+
+## Disclaimer
+
+I wrote the bulk of the code over the weekend, so please let me know if there's any bugs 💀
