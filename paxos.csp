@@ -2,27 +2,33 @@
 #define N 8; 
 
 // entities
-#define PROPOSERS 2;
-#define ACCEPTORS 3;
+#define PROPOSERS 2; // please update for scenario 6
+#define ACCEPTORS 3; // please update for scenario 6
 #define LEARNERS 2;
 
 // message types
-#define PASS 1000;
-#define NACK -99;
-#define FAIL -1000;
-#define INACTIVE -999;
-#define ACCEPTOR_FAILED -1001;
+enum {
+	PASS,
+	NACK,
+	FAIL, 
+	INACTIVE,
+	ACCEPTOR_FAILED
+};
 
 // acceptor states
 var acceptor_prepare_status = [PASS(ACCEPTORS)];
 var acceptor_can_broadcast = [NACK(ACCEPTORS)];
-var acceptor_promised_id = [-1(N)];
+var acceptor_promised_id = [-1(ACCEPTORS)];
 var acceptor_accept_values = [-1(ACCEPTORS)];
 var acceptor_accept_id = [-1(ACCEPTORS)];
 var acceptor_status = [PASS(ACCEPTORS)];
+var acceptor_number_of_accepts =[0(ACCEPTORS)];
 
 // proposer states
 var proposer_status = [PASS(PROPOSERS)];
+
+// learner states
+var learner_status = [PASS(LEARNERS)];
 
 // global state for proposer
 var global_accepted_value = -1;
@@ -30,15 +36,11 @@ var global_elected_leader = 0;
 var global_terminate = false;
 var global_id = 0;
 
-var hasNack = false;
-
-var highest_id = -1;
-var last_accepted = -1;
-
 // client state
 var client_proposed_value = -1;
 var client_read_value = -1;
 var client_consensus = -1;
+var client_can_propose = false;
 
 // for validating quorums
 var quorums = ACCEPTORS / 2 + 1;
@@ -47,7 +49,11 @@ var promise_received = 0;
 var accept_reads = 0;
 var accepted_received = 0;
 
-var retry = false;
+// to indicate that the proposer should retry
+var retry = false; 
+var hasNack = false;
+var highest_id = -1;
+var last_accepted = -1;
 
 // channels
 channel reset[ACCEPTORS] 0;
@@ -60,40 +66,47 @@ channel accept_channel [ACCEPTORS] 0;
 channel client_proposer 0;
 channel learner_client 0;
 
-Proposer(state, i) = 
+// each proposer interleaves but only the elected leader can run
+Proposer(state, i, canRecover) = 
+	start -> 
 	if (global_elected_leader == i) {
+		// client may propose new values
 		client_proposer?value {
-			client_proposed_value = value
-		} -> ProposerState(state, i) [] ([client_proposed_value != -1] ProposerState(state, i))
+			client_proposed_value = value;
+			client_can_propose = false;
+		} -> ProposerState(state, i, canRecover) [] ([client_proposed_value != -1] client_does_not_propose_value {client_can_propose = false} -> ProposerState(state, i, canRecover))
 	} else {
-		Skip
+		Stop
 	};
 
-ProposerState(state, curr) = 
+// ProposerState tracks the current id of the proposer and increment it if required
+ProposerState(state, curr, canRecover) = 
 	if (global_id >= state) {
-		ProposerState(global_id + 1, curr)
+		// global_id is the last used global id 
+		// so any requests afterwards will need to be higher
+		ProposerState(global_id + 1, curr, canRecover) 
 	} else {
-		// 1a. PREPARE
+		// Phase 1a. PREPARE
 		SendPrepareMsg(state, curr);
 		atomic { 
 			if (prepare_reads < quorums) {
 				atomic { PreparePhaseEnds() };
 				atomic { (|||a:{0..ACCEPTORS-1}@(reset[a]!curr.FAIL -> Skip)) };
-				ProposerState(state, curr) 
+				ProposerState(state, curr, canRecover) 
 		}};
 		if (prepare_reads >= quorums) {
 			atomic { PreparePhaseEnds() };
-			// 1b. PROMISE
+			// Phase 1b. PROMISE
 			(|||y:{0..ACCEPTORS-1}@(promise_channel[y]?prev_promised_id.prev_acceptor_val.val{
 				if (val == NACK) { global_terminate = true; global_id = prev_promised_id }
-				if (val != INACTIVE && val != FAIL) { promise_received = promise_received + 1 }
+				if (val != INACTIVE && val != FAIL && val != ACCEPTOR_FAILED) { promise_received = promise_received + 1 }
 			} -> Skip));
 			atomic {
 				if (promise_received < quorums) {
 					atomic { 
 						atomic { ResetPromiseReceived() };
-						atomic { (|||a:{0..ACCEPTORS-1}@(reset[a]!curr.FAIL -> Skip)) }; // TODO: fix the reroute to tgt state 8 problem
-						ProposerState(state, curr) 
+						atomic { (|||a:{0..ACCEPTORS-1}@(reset[a]!curr.FAIL -> Skip)) };
+						ProposerState(state, curr, canRecover) 
 					}
 			}};
 			if (promise_received >= quorums) {
@@ -102,70 +115,86 @@ ProposerState(state, curr) =
 				// next request must be larger than current state
 				if (global_terminate) {
 					atomic { (|||a:{0..ACCEPTORS-1}@(reset[a]!curr.FAIL -> Skip)) };
-					ProposerState(state, curr) // retry
+					ProposerState(state, curr, canRecover) // retry
 				} else {
 					atomic { promise_phase_ends { global_id = state } -> Skip };
 					
 					// if proposer fails BEFORE sending the first ACCEPT message
 					// then there's no reason to proceed further because none of the acceptors will return a successful ACCEPTED message
 					// hence we immediately reset the entire state
-					(	// 2a. ACCEPT      				 // 2b. ACCEPTED 
+					(	// Phase 2a. ACCEPT      		 Phase 2b. ACCEPTED 
 						(SendsAcceptMsg(curr, state) ||| ((|||{ACCEPTORS}@(accepted_channel_proposer?val.status {
 									if (status == PASS) { client_consensus = val };
-//									if (status == NACK) { retry = true }
 								} -> Skip)))); 
 						atomic { end_of_broadcast -> Skip } ;
 						if (global_terminate) {
-							ElectNewLeader(state, curr)
-						};
-						if (retry) {
+							ElectNewLeader(state, curr, canRecover) [] Stop // if there are no more leaders to choose from, just stop
+						} else if (retry) {
 							atomic { (|||a:{0..ACCEPTORS-1}@(reset[a]!curr.FAIL -> Skip)) };
 							// retry and elect ARE TWO DIFFERENT THINGS 
 							// retry - proposer did not die
 							// elect - proposer died
-							ProposerState(state, curr) 
-						}
+							ProposerState(state, curr, canRecover) 
+						} else {
+							Stop
+						}	
 					) 
 				}
 			}
 		}
 	};
-	
-ElectNewLeader(state, curr) = 
+
+// for electing a new leader, we check that the new leader is not the current, 
+// and not any of the previously failed nodes
+ElectNewLeader(state, curr, canRecover) = 
 	if (curr == 0) {
-		ElectNewLeaderRange(0, PROPOSERS - 1, state, curr)
+		ElectNewLeaderRange(0, PROPOSERS - 1, state, curr, canRecover)
 	};
 	
 	if (curr == PROPOSERS - 1) {
-		ElectNewLeaderRange(0, PROPOSERS - 2, state, curr)
+		ElectNewLeaderRange(0, PROPOSERS - 2, state, curr, canRecover)
 	};
 	
 	if (0 < curr && curr < PROPOSERS - 1) {
-		ElectNewLeaderRange(0, curr - 1, state, curr) [] 
-		ElectNewLeaderRange(curr + 1, PROPOSERS - 1, state, curr) 
+		ElectNewLeaderRange(0, curr - 1, state, curr, canRecover) [] 
+		ElectNewLeaderRange(curr + 1, PROPOSERS - 1, state, curr, canRecover) 
 	};
 	
-ElectNewLeaderRange(low, high, state, curr) = 
-	[]i:{low..high}@([proposer_status[i] == PASS]
-		(|||a:{0..ACCEPTORS-1}@(reset[a]!i.FAIL -> Skip));
-		elect_new_leader {
-			global_elected_leader = i;
-			global_terminate = false;
-			proposer_status[global_elected_leader] = PASS;
-			accept_reads = 0; // reset reads
-		} -> (
-			Proposer(acceptor_promised_id[i] + 1, i) |||
-			(recover { 
-					global_id = state; 
-					hasNack = false;
-					global_elected_leader = curr;
-					proposer_status[curr] = PASS;
-				}-> atomic { 
-					(|||a:{0..ACCEPTORS-1}@(reset[a]!curr.FAIL -> Skip))};
-					Proposer(state, curr)
-				)
-		)
-	) ;
+ElectNewLeaderRange(low, high, state, curr, canRecover) = 
+	[canRecover == true]  (
+		[]i:{low..high}@([proposer_status[i] == PASS]
+			(|||a:{0..ACCEPTORS-1}@(reset[a]!i.FAIL -> Skip));
+			elect_new_leader {
+				global_elected_leader = i;
+				global_terminate = false;
+				proposer_status[global_elected_leader] = PASS;
+				accept_reads = 0; // reset reads
+				client_can_propose = true;
+			} -> (
+				Proposer(acceptor_promised_id[i] + 1, i, canRecover) |||
+				(recover { 
+						global_id = state; 
+						hasNack = false;
+						global_elected_leader = curr;
+						proposer_status[curr] = PASS;
+					}-> atomic { 
+						(|||a:{0..ACCEPTORS-1}@(reset[a]!curr.FAIL -> Skip))};
+						Proposer(state, curr, canRecover)
+					)
+			)
+		) 
+	) [] [canRecover == false] (
+		[]i:{low..high}@([proposer_status[i] == PASS]
+			(|||a:{0..ACCEPTORS-1}@(reset[a]!i.FAIL -> Skip));
+			elect_new_leader {
+				global_elected_leader = i;
+				global_terminate = false;
+				proposer_status[global_elected_leader] = PASS;
+				accept_reads = 0; // reset reads
+				client_can_propose = true;
+			} -> Proposer(acceptor_promised_id[i] + 1, i, canRecover) 
+		) 
+	);
 	
 SendPrepareMsg(state, curr) = 
 	atomic { |||x:{0..ACCEPTORS-1}@(prepare_channel[x]!curr.state.PASS -> Skip [] prepare_channel[x]!curr.state.FAIL -> Skip) };
@@ -178,7 +207,7 @@ ResetPromiseReceived() =
 
 // if no value is accepted previously, use the client_proposed_value
 SendsAcceptMsg(curr, state) =  // an accept message 
-	if (global_accepted_value == -1) {
+	if (global_accepted_value == -1) { // no previously accepted value
 		// by not making it atomic, this allows next step to be triggered once quorum is achieved.
 		// if atomic, we can only move on once all acceptors have sent their accept.
 		(|||z:{0..ACCEPTORS-1}@accept_channel[z]!proposer_status[curr].state.client_proposed_value.acceptor_status[z] -> Skip) 
@@ -240,7 +269,7 @@ ReceivePrepare(i) =
 		}
 	} -> Skip;
 	
-ResetAcceptor(i, clear) = 
+ResetAcceptor(i, clear) = (
 	reset[i]?curr.x {
 		acceptor_can_broadcast[i] = NACK;
 		acceptor_prepare_status[i] = PASS;
@@ -249,7 +278,8 @@ ResetAcceptor(i, clear) =
 			global_terminate = false;
 			retry = false;
 		}
-	} -> AcceptorState(i);
+	} -> AcceptorState(i)
+) [] Stop;
 	
 ReceivesAcceptMsg(i) =
 	accept_channel[i]?proposer_alive.state.av.status {
@@ -261,6 +291,7 @@ ReceivesAcceptMsg(i) =
 					acceptor_accept_values[i] = av; // update accepted value
 					acceptor_accept_id[i] = state; // update accepted value
 					acceptor_can_broadcast[i] = PASS;
+					acceptor_number_of_accepts[i] = acceptor_number_of_accepts[i] + 1;
 				} else {
 					retry = true; 
 				}
@@ -275,7 +306,7 @@ SendPromise(i) =
 		([hasNack == true] promise_channel[i]!acceptor_promised_id[i].acceptor_accept_values[i].NACK -> Skip) []
 		([hasNack == false] promise_channel[i]!acceptor_promised_id[i].acceptor_accept_values[i].PASS -> Skip) [] 
 		(promise_channel[i]!acceptor_promised_id[i].acceptor_accept_values[i].FAIL -> Skip) [] 
-		(promise_channel[i]!acceptor_promised_id[i].acceptor_accept_values[i].ACCEPTOR_FAILED { acceptor_status[i] = FAIL } -> Skip) 
+		(promise_channel[i]!acceptor_promised_id[i].acceptor_accept_values[i].ACCEPTOR_FAILED { acceptor_status[i] = FAIL; acceptor_promised_id[i] = -1 } -> Skip) 
 	};
 	
 BroadcastAccepted(i) = 
@@ -292,25 +323,928 @@ Learner(i) =
 		if (client_consensus == -1) {
 			Learner(i)
 		} else {
-			(([accept_reads >= quorums] learner_client!i.client_consensus -> Skip) [] ([accept_reads >= quorums] learner_client!i.FAIL -> Skip) [] (reset_learner -> Learner(i)))
+			(([accept_reads >= quorums] learner_client!i.client_consensus -> Stop) [] ([accept_reads >= quorums] learner_client!i.FAIL { learner_status[i] = FAIL } -> Stop) [] (reset_learner -> Learner(i)))
 		}
 	};
 
 
-Client(value) = (
-		client_proposer!value -> Skip;
-		(|||{LEARNERS}@(learner_client?i.x {
+Client(value) =
+		client_proposer!value -> (((|||{LEARNERS}@(learner_client?i.x {
 		 	if (x != FAIL) {
 			 	client_read_value = x
 			}       // after proposing a value, you can interrupt and propose a new value
 			        // that way when the next reset point happens you can set a new value
-		} -> Skip));
-		finish { client_consensus = -1 } -> Skip
-	)  interrupt propose_new_value -> Client(value + 1) ;
+		} -> Skip)); atomic { finish { client_consensus = -1 } -> Stop }) []  [client_can_propose == true] (propose_new_value -> Client(value + 1)));
 
 // entry point
-System = Client(123) || Proposer(global_id + 1, 0) 
+var client_value = 123;
+System = Client(client_value) || Proposer(global_id + 1, 0, true) 
 					 || (|||x:{0..ACCEPTORS-1}@Acceptor(x)) 
 					 || (|||y:{0..LEARNERS-1}@Learner(y));
 
+// simplified model with no recover capabilities for proposer (to reduce number of states for verification)
+SystemWithNoRecover = Client(client_value) || Proposer(global_id + 1, 0, false) 
+					 || (|||x:{0..ACCEPTORS-1}@Acceptor(x)) 
+					 || (|||y:{0..LEARNERS-1}@Learner(y));
 
+// NOTE: For the verifications below, please use BFS.
+
+// for verification
+#define CONSENSUS_IS_ACHIEVED client_read_value == client_value;
+#define CONSENSUS_IS_NOT_ACHIEVED client_read_value != client_value;
+#define PROMISE_MAJORITY promise_received >= quorums;
+
+// scenario 0
+#assert System reaches CONSENSUS_IS_ACHIEVED; // there exists a trace where consensus is successfully achieved
+#assert System |= !<>finish; // all traces does not finish - should be INVALID
+
+// scenario 1
+#define S1_CONSENSUS_IS_ACHIEVED client_read_value == client_value;
+#define S1_CURRENT_ACCEPTOR_STATUS acceptor_status[0] == PASS && acceptor_status[1] == PASS && acceptor_status[2] == FAIL;
+#define S1_CURRENT_ACCEPTOR_PROMISED_ID acceptor_promised_id[0] == 1 && acceptor_promised_id[1] == 1 && acceptor_promised_id[2] == -1;
+#define S1_CURRENT_ACCEPTOR_CAN_BROADCAST_STATUS acceptor_can_broadcast[0] == PASS && acceptor_can_broadcast[1] == PASS && acceptor_can_broadcast[2] == NACK;
+
+#define S1 S1_CURRENT_ACCEPTOR_STATUS && S1_CURRENT_ACCEPTOR_CAN_BROADCAST_STATUS && S1_CURRENT_ACCEPTOR_PROMISED_ID && S1_CONSENSUS_IS_ACHIEVED;
+#assert System reaches S1;
+#assert System |= !<>S1_CURRENT_ACCEPTOR_STATUS; // will never have acceptor failures - should be INVALID
+
+// scenario 2
+#define S2_CONSENSUS_IS_ACHIEVED client_read_value == client_value;
+#define S2_LEARNER_STATUS learner_status[0] == FAIL && learner_status[1] == PASS;
+#define S2_CURRENT_ACCEPTOR_STATUS acceptor_status[0] == PASS && acceptor_status[1] == PASS && acceptor_status[2] == PASS;
+#define S2_CURRENT_ACCEPTOR_PROMISED_ID acceptor_promised_id[0] == 1 && acceptor_promised_id[1] == 1 && acceptor_promised_id[2] == 1;
+#define S2_CURRENT_ACCEPTOR_CAN_BROADCAST_STATUS acceptor_can_broadcast[0] == PASS && acceptor_can_broadcast[1] == PASS && acceptor_can_broadcast[2] == PASS;
+
+#define S2 S2_CURRENT_ACCEPTOR_STATUS && S2_CURRENT_ACCEPTOR_CAN_BROADCAST_STATUS && S2_CURRENT_ACCEPTOR_PROMISED_ID && S2_LEARNER_STATUS && S2_CONSENSUS_IS_ACHIEVED;
+#assert System reaches S2;
+#assert System |= !<>S2_LEARNER_STATUS; // will never have learner failures - should be INVALID
+
+//// scenario 3
+#define S3_NEW_ELECTED_LEADER global_elected_leader == 1;
+#define S3_ELECTED_LEADER_NOT_FAIL proposer_status[0] == FAIL && proposer_status[1] == PASS; 
+#define S3_NEW_CLIENT_VALUE client_proposed_value == 124;
+#define S3 S3_NEW_ELECTED_LEADER && S3_ELECTED_LEADER_NOT_FAIL && S3_ELECTED_LEADER_NOT_FAIL && S3_NEW_CLIENT_VALUE;
+#assert System reaches S3;
+#assert System |= !<>proposer_fails; // will never have proposer_failures - should be INVALID
+#assert SystemWithNoRecover |= [](proposer_fails -> G CONSENSUS_IS_NOT_ACHIEVED); // should be INVALID
+
+// scenario 4
+#define S4_CURRENT_ACCEPTOR_PROMISED_ID acceptor_promised_id[0] == 2 && acceptor_promised_id[1] == 2 && acceptor_promised_id[2] == 2 ;
+#define S4_PROPOSER_STATUS proposer_status[0] == FAIL && proposer_status[1] == PASS;
+#define S4 S4_PROPOSER_STATUS && S4_CURRENT_ACCEPTOR_PROMISED_ID;
+#assert System reaches S4;
+#assert System |= !<>recover; // will never recover - should be INVALID
+
+// scenario 5
+#define S5 acceptor_number_of_accepts[0] == 1; 
+#assert SystemWithNoRecover |=  [](S5 -> G S5); // if accept_count == 1, doesnt mean it'll always remain as 1 therefore it should be INVALID
+
+// scenario 6
+#assert System |= !<>propose_new_value; // will never propose new value - should be INVALID
+
+// scenario 7 
+// if consensus is already achieved before the proposer fails, than reviving the proposer 
+// or electing a new leader would not change the consensus.
+#define S7_NEW_ELECTED_LEADER global_elected_leader == 1;
+#define S7_ELECTED_LEADER_NOT_FAIL proposer_status[0] == FAIL && proposer_status[1] == PASS;
+#define S7_NEW_CLIENT_VALUE client_proposed_value == 123;
+#define ACCEPT_RECEIVED accept_reads == 1;
+#define S7 S7_NEW_ELECTED_LEADER && S7_ELECTED_LEADER_NOT_FAIL && S7_NEW_CLIENT_VALUE && ACCEPT_RECEIVED;
+#define S7_CONSENSUS_NOT_ACHIEVED client_read_value != client_value;
+#assert SystemWithNoRecover |= [](S7 -> G S7_CONSENSUS_NOT_ACHIEVED);
+
+/**
+// Scenario 0 Trace - No Error
+init
+start
+[if((global_elected_leader == 0])]  ------------------------------------------ checks if proposer is elected
+client_proposer.123 ---------------------------------------------------------- client proposed value 123
+[if![(global_id >=1]]
+prepare_channel[0].0.1.PASS -------------------------------------------------- proposer 0 send over prepare message with value 1 
+prepare_channel[1].0.1.PASS
+prepare_channel[2].0.1.PASS
+[if!(prepare_reads < quorums])] ---------------------------------------------- validation for number of successful prepare messages 
+[if(prepare_reads>=quorums)])
+prepare_ends ----------------------------------------------------------------- prepare phase ends
+[if![[[acceptor_prepare_status[0] == FAIL) || (acceptor_status[0] == FAIL)
+[if![((acceptor_prepare_status[1] == FAIL) II (acceptor_status[1] == FAIL]
+[if![[(acceptor_prepare_status[2] == FAIL) || (acceptor_status[2] == FAIL]
+promise_channel[0].1.-1.PASS ------------------------------------------------- acceptors send over promise message with value 1
+promise_channel[1].1.-1.PASS
+promise_channel[2].1.-1.PASS
+[if!(promise_received < quorums])] ------------------------------------------- validation for number of promise message received
+[if((promise_received >= quorums])]
+reset_promise_count
+[if!global_terminate]]
+promise_phase_ends ----------------------------------------------------------- promise phase ends
+[ifflglobal_accepted_value == -(1)])]
+accept_channel[0].PASS.1.123.PASS -------------------------------------------- proposer sends accept message denoting the proposed value 123 and id 1
+accept_channel[1]PASS.1.123.PASS
+accept_channel[2]PASS.1.123.PASS
+proposer_did_not_fail_when_sending_accept ------------------------------------ if proposer did not fail when sending the accept messages, we need to let the model know
+accepted_channel_learner[0].123.PASS ----------------------------------------- acceptor broadcast accepted message to learner 1, learner 2 and proposer
+accepted_channel_learner[1].123.PASS
+accepted_channel_proposer.123.PASS
+accepted_channel_learner[0].123.PASS ----------------------------------------- acceptor broadcast accepted message to learner 1, learner 2 and proposer
+accepted_channel_learne[1].123.PASS
+accepted_channel_proposer.123.PASS
+accepted_channel_learner[0].123.PASS ----------------------------------------- acceptor broadcast accepted message to learner 1, learner 2 and proposer
+[if![(client_consensus == -[1])]
+learner_client.0.123 --------------------------------------------------------- learner received all the accepted messages and sends it to client
+accepted_channel_proposer.123.PASS
+end_of_broadcast ------------------------------------------------------------- acceptors finish broadcasting
+[if! global_terminate]]
+[if![retry]]
+accepted_channel_learner[1].123.PASS
+[if![[client_consensus == -{1])]
+learner_client.1.123 --------------------------------------------------------- learner received all the accepted messages and sends it to client
+finish
+
+// Scenario 1 Trace - Acceptor Fails
+init
+start
+[if[[[global_elected_leader == 0])] ------------------------------------------ checks if proposer is elected
+client_proposer.123 ---------------------------------------------------------- client proposed value 123
+[if![[global_id>=1])]
+prepare_channel[0].0.1.PASS -------------------------------------------------- proposer 0 send over prepare message with value 1 
+prepare_channel[1].0.1.PASS
+prepare_channel[2].0.1.PASS
+[if!(prepare_reads < quorums])] ---------------------------------------------- validation for number of successful prepare messages 
+[if(prepare_reads>=quorums)])
+prepare_ends ----------------------------------------------------------------- prepare phase ends
+[if!(((acceptor_prepare_status[0] == FAIL) || (acceptor_status[0] == FAIL)
+[if!(((acceptor_prepare_status[1] == FAIL) || (acceptor_status[1] == FAIL)
+[if!(((acceptor_prepare_status[2] == FAIL) || (acceptor_status[2] == FAIL)
+promise_channel[0].1.-1.PASS ------------------------------------------------- acceptors send over promise message with value 1
+promise_channel[1].1.-1.PASS
+promise_channel[2].1.-1.ACCEPTOR_FAILED -------------------------------------- acceptor 2 failed when sending promise message with value 1
+[if!((promise_received < quorums])]
+[if[[promise_received >= quorums])] ------------------------------------------ remains valid because promise_received >= quorums
+reset_promise_count
+[if!global_terminate]]
+promise_phase_ends ----------------------------------------------------------- promise phase ends
+[if([global_accepted_value == -(1))]
+accept_channel[0].PASS.1.123.PASS
+accept_channel[1].PASS.1.123.PASS
+accept_channel[2].PASS.1.123.FAIL -------------------------------------------- accept message failed to send
+proposer_did_not_fail_when_sending_accept ------------------------------------ if proposer did not fail when sending the accept messages, we need to let the model know
+accepted_channel_learner[0].123.PASS ----------------------------------------- acceptor broadcast accepted message to learner 1, learner 2 and proposer
+accepted_channel_learner[1].123.PASS
+accepted_channel_proposer 123.PASS
+accepted_channel_learner[0].123.PASS
+accepted_channel_learner[1].123.PASS
+accepted_channel_proposer 123.PASS
+accepted_channel_learner[0].-1.NACK ------------------------------------------ NACK for accepted message if broadcast is from a failed acceptor node
+[if![[client_consensus == -[1])]
+learner_client.0.123 --------------------------------------------------------- learner received all the accepted messages and sends it to client
+accepted_channel_learner[1].-1.NACK
+[if![(client_consensus == -(1)])]
+learner_client.1.123
+finish
+end_of_broadcast ------------------------------------------------------------- acceptors finish broadcasting
+[if! global_terminate]]
+[if![retry]]
+
+// Scenario 2 - Redundant Learner
+init
+start
+[if((global_elected_leader == 0])]  ------------------------------------------ checks if proposer is elected
+client_proposer.123 ---------------------------------------------------------- client proposed value 123
+[if![(global_id >=1]]
+prepare_channel[0].0.1.PASS -------------------------------------------------- proposer 0 send over prepare message with value 1 
+prepare_channel[1].0.1.PASS
+prepare_channel[2].0.1.PASS
+[if!(prepare_reads < quorums])] ---------------------------------------------- validation for number of successful prepare messages 
+[if(prepare_reads>=quorums)])
+prepare_ends ----------------------------------------------------------------- prepare phase ends
+[if![[[acceptor_prepare_status[0] == FAIL) || (acceptor_status[0] == FAIL)
+[if![[[acceptor_prepare_status[1] == FAIL) || (acceptor_status[1] == FAIL)
+[if![[[acceptor_prepare_status[2] == FAIL) || (acceptor_status[2] == FAIL)
+promise_channel[0].1.-1.PASS ------------------------------------------------- acceptors send over promise message with value 1
+promise_channel[1].1.-1.PASS
+promise_channel[2].1.-1.PASS
+[if![promise_received < quorums])]
+[if[[promise_received >= quorums])] ------------------------------------------ remains valid because promise_received >= quorums
+reset_promise_count
+[if! global_terminate]]
+promise_phase_ends ----------------------------------------------------------- promise phase ends
+[if[[global_accepted_value == -(1)])]
+accept_channel[0].PASS.1.123.PASS
+accept_channel[1]PASS.1.123.PASS
+accept_channel[2]PASS.1.123.PASS
+proposer_did_not_fail_when_sending_accept ------------------------------------ if proposer did not fail when sending the accept messages, we need to let the model know
+accepted_channel_learner[0].123.PASS ----------------------------------------- acceptor broadcast accepted message to learner 1, learner 2 and proposer
+accepted_channel_learne[1].123.PASS
+accepted_channel_proposer.123.PASS
+accepted_channel_learner[0].123.PASS ----------------------------------------- acceptor broadcast accepted message to learner 1, learner 2 and proposer
+accepted_channel_learner[1].123.PASS
+accepted_channel_proposer 123.PASS
+accepted_channel_proposer.123.PASS
+end_of_broadcast ------------------------------------------------------------- acceptors finish broadcasting
+[if! global_terminate]]
+[if![retry]]
+accepted_channel_learner[0].123.PASS
+[if![[client_consensus == -(1)])
+learner_client.1.123 --------------------------------------------------------- learner received all the accepted messages and sends it to client
+accepted_channel_learner[1].123.PASS
+[if![[client_consensus == -{1])]
+learner_client.1.FAIL -------------------------------------------------------- learner fails and cannot send to client
+finish
+
+// Scenario 3 - proposer fails
+init
+start
+[if((global_elected_leader == 0])]  ------------------------------------------ checks if proposer is elected
+client_proposer.123 ---------------------------------------------------------- client proposed value 123
+[if![(global_id >=1]]
+prepare_channel[0].0.1.PASS -------------------------------------------------- proposer 0 send over prepare message with value 1 
+prepare_channel[1].0.1.PASS
+prepare_channel[2].0.1.PASS
+[if!(prepare_reads < quorums])]
+[if(prepare_reads >=quorums])]
+prepare_ends ----------------------------------------------------------------- prepare phase ends
+[i!![[(acceptor_prepare_status[0] == FAIL) II (acceptor_status[0] == FAIL]
+[if![[[acceptor_prepare_status[1] == FAIL) || (acceptor_status[1] == FAIL)
+[i!![[(acceptor_prepare_status[2] == FAIL) || (acceptor_status[2] == FAIL)
+promise_channel[0].1.-1.PASS ------------------------------------------------- acceptors send over promise message with value 1
+promise_channel[1].1.-1.PASS
+promise_channel[2].1.-1.PASS
+[if!(promise_received < quorums)]]
+[if((promise_received >= quorums)]
+reset_promise_count
+[if![global_terminate]]
+promise_phase_ends ----------------------------------------------------------- promise phase ends
+[if!([global_accepted_value == -(1)])]
+accept_channel[0].PASS.1.123.PASS
+proposer_fails --------------------------------------------------------------- proposer fails, all subsequent accept messages will fail as well (and accepted messages will NACK)
+accepted_channel_learner[0].123.PASS ----------------------------------------- acceptor broadcast accepted message to learner 1, learner 2 and proposer
+accepted_channel_learner[1].123.PASS
+accepted_channel_proposer 123.PASS
+accept_channel[1].FAIL.1.123.PASS
+accept_channel[2].FAIL.1.123.PASS  ------------------------------------------- accept message failed
+accepted_channel_learner[0].-1.NACK
+accepted_channel_learner[1].-1.NACK
+accepted_channel_proposer.-1.NACK
+accepted_channel_learner[0].-1.NACK
+[if![(client_consensus == -[1])]
+reset_learner ---------------------------------------------------------------- reset learner so that it can receives the next message
+accepted_channel_learner[1].-1.NACK
+[if![(client_consensus == -(1)])]
+reset_learner ---------------------------------------------------------------- reset learner so that it can receives the next message
+accepted_channel_proposer.-1.NACK
+end_of_broadcast ------------------------------------------------------------- acceptors finish broadcasting
+[if[global_terminate]]
+[if((0== 0)]
+reset[0].1.FAIL
+reset[1].1.FAIL
+reset[2].1.FAIL
+elect_new_leader ------------------------------------------------------------- new leader elected, all acceptor states reset
+[if[[[global_elected_leader==1])] -------------------------------------------- check if current proposer is the elected leader
+client_does_not_propose_value
+[if!((global_id>=2)]]
+prepare_channel[0].1.2.PASS -------------------------------------------------- sends prepare message with value 2
+prepare_channel[1].1.2.PASS
+prepare_channel[2].1.2.PASS
+[if![[prepare_reads < quorums])]
+[if[[prepare_reads >=quorums])]
+prepare_ends ----------------------------------------------------------------- prepare phase ends
+[i!![[[acceptor_prepare_status[0] == FAIL) || (acceptor_status[0] == FAIL)
+[i!![[(acceptor_prepare_status[1] == FAIL) || (acceptor_status[1] == FAIL)
+[i!!(((acceptor_prepare_status[2] == FAIL) || (acceptor_status[2] == FAIL)
+promise_channel[0].2.123.PASS
+promise_channel[1].2.-1.PASS
+promise_channel[2].2.-1.PASS
+[if![[promise_received < quorums])]
+[if[[promise_received >= quorums])] ------------------------------------------ remains valid because promise_received >= quorums
+reset_promise_count
+[if! (global_terminate]]
+promise_phase_ends ----------------------------------------------------------- promise phase ends
+[if!((global_accepted_value == -(1)])]
+proposer_did_not_fail_when_sending_accept ------------------------------------ if proposer did not fail when sending the accept messages, we need to let the model know
+accept_channel[0].PASS.2.123.PASS
+accepted_channel_learner[0].123.PASS ----------------------------------------- acceptor broadcast accepted message to learner 1, learner 2 and proposer
+accepted_channel_learner[1].123.PASS
+accept_channel[1].PASS.2.123.PASS
+accepted_channel_learner[0].123.PASS ----------------------------------------- acceptor broadcast accepted message to learner 1, learner 2 and proposer
+accepted_channel_learner[1].123.PASS
+accept_channel[2].PASS.2.123.PASS
+accepted_channel_learner[1].123.PASS
+accepted_channel_leamer[0].123.PASS
+[if!((client_consensus == -(1)])]
+[if!(client_consensus == -(1)])]
+learner_client.1.123 --------------------------------------------------------- learner received all the accepted messages and sends it to client
+learner_client.1.123
+finish
+accepted_channel_proposer 123.PASS
+accepted_channel_proposer.123.PASS
+accepted_channel_proposer 123.PASS
+end_of_broadcast ------------------------------------------------------------- acceptors finish broadcasting
+[if![global_terminate]]
+[if![retry]]
+
+// Scenario 4 - multiple proposers conflict
+init
+start
+[if((global_elected_leader == 0])]  ------------------------------------------ checks if proposer is elected
+client_proposer.123 ---------------------------------------------------------- client proposed value 123
+[if![(global_id >=1]]
+prepare_channel[0].0.1.PASS -------------------------------------------------- proposer 0 send over prepare message with value 1 
+prepare_channel[1].0.1.PASS
+prepare_channel[2].0.1.PASS
+[if![[prepare_reads < quorums])]
+[if(prepare_reads >= quorums])]
+prepare_ends ----------------------------------------------------------------- prepare phase ends
+[if![[[(acceptor_prepare_status[0] == FAIL) || (acceptor_status[0] == FAIL
+[if![[[[acceptor_prepare_status[1] == FAIL) || (acceptor_status[1] == FAIL
+[if![[[(acceptor_prepare_status[2] == FAIL) || (acceptor_status[2] == FAIL
+promise_channel[0].1.-1.PASS ------------------------------------------------- acceptors send over promise message with value 1
+promise_channel[1].1.-1.PASS
+promise_channel[2].1.-1.PASS
+[if!(promise_received < quorums])]
+[if((promise_received >=quorums])]
+reset_promise_count
+[if!(global_terminate]]
+promise_phase_ends ----------------------------------------------------------- promise phase ends
+[if[[global_accepted_value == -(1)])]
+proposer_fails --------------------------------------------------------------- proposer fails, all subsequent accept messages will fail as well (and accepted messages will NACK)
+accept_channel[0].FAIL.1.123.PASS
+accepted_channel_learner[0].-1.NACK
+accepted_channel_learner[1].-1.NACK
+accepted_channel_proposer.-1.NACK
+accept_channel[1].FAIL.1.123.PASS
+accepted_channel_learner[0].-1.NACK
+accepted_channel_learner[1].-1.NACK
+accepted_channel_proposer.-1.NACK
+accept_channel[2].FAIL.1.123.PASS  ------------------------------------------- accept message failed
+accepted_channel_learner[0].-1.NACK
+[if[[client_consensus == -[1])]
+accepted_channel_learner[1].-1.NACK
+[if[[(client_consensus == -[1])]
+accepted_channel_proposer.-1.NACK
+end_of_broadcast ------------------------------------------------------------- acceptors finish broadcasting
+[if[global_terminate]]
+[if((0 == 0)]
+reset[0].1.FAIL
+reset[1].1.FAIL
+reset[2].1.FAIL
+elect_new_leader ------------------------------------------------------------- new leader elected, all acceptor states reset
+[if[[[global_elected_leader==1])]
+client_does_not_propose_value
+[if!((global_id >= 2)]
+prepare_channel[0].1.2.PASS -------------------------------------------------- sends prepare message with value 2
+prepare_channel[1].1.2.PASS
+prepare_channel[2].1.2.PASS
+[if!((prepare_reads < quorums])]
+[if([prepare_reads >= quorums])]
+prepare_ends ----------------------------------------------------------------- prepare phase ends
+[if!(((acceptor_prepare_status[0] == FAIL) || (acceptor_status[0] == FAIL)
+[if!(((acceptor_prepare_status[1] == FAIL) || (acceptor_status[1] == FAIL)
+[ii![[[acceptor_prepare_status[2] == FAIL) || (acceptor_status[2] == FAIL)
+promise_channel[0].2.-1.PASS
+promise_channel[1].2.-1.PASS
+promise_channel[2].2.-1.PASS
+[if!(promise_received < quorums])]
+[if((promise_received >= quorums])]
+reset_promise_count
+[if![global_terminate]]
+promise_phase_ends ----------------------------------------------------------- promise phase ends
+recover
+reset[0].0.FAIL
+reset[1].0.FAIL
+reset[2].0.FAIL
+start
+[if[[global_elected_leader == 0])]
+client_does_not_propose_value
+[if[[(global_id >= 1 )]
+[if!((global_id >=2)]]
+prepare_channel[0].0.2.PASS -------------------------------------------------- proposer 0 sends a prepare message with value 2
+prepare_channel[1].0.2.PASS
+prepare_channel[2].0.2.PASS
+[if!(prepare_reads < quorums])]
+[if((prepare_reads >=quorums])]
+prepare_ends ----------------------------------------------------------------- prepare phase ends
+[ii![[[acceptor_prepare_status[0] == FAIL) || (acceptor_status[0] == FAIL)
+[if!(((acceptor_prepare_status[1] == FAIL) || (acceptor_status[1] == FAIL)
+[ii![[[acceptor_prepare_status[2] == FAIL) || (acceptor_status[2] == FAIL)
+promise_channel[0].2.-1.NACK ------------------------------------------------- promise received is a NACK, indicating that a previous id of higher or equal value has been promised
+promise_channel[1].2.-1.NACK
+promise_channel[2].2.-1.NACK
+[if!(promise_received < quorums])]
+[if((promise_received >= quorums])]
+reset_promise_count
+[if[global_terminate]]
+reset[0].0.FAIL
+reset[1].0.FAIL
+reset[2].0.FAIL
+[if[[global_id >=2)]]
+[if![[global_id>=3])]
+prepare_channel[0].0.3.PASS -------------------------------------------------- proposer 0 sends a prepare message with value 3
+prepare_channel[1].0.3.PASS
+prepare_channel[2].0.3.PASS
+[if![[prepare_reads < quorums])]
+[if([prepare_reads >= quorums])]
+prepare_ends ----------------------------------------------------------------- prepare phase ends
+[i!![[[[acceptor_prepare_status[0] == FAIL) || (acceptor_status[0] == FAIL
+[if![[[[acceptor_prepare_status[1] == FAIL) || (acceptor_status[1] == FAIL
+[I!![[[[acceptor_prepare_status[2] == FAIL) || (acceptor_status[2] == FAIL)
+promise_channel[0].3.-1.PASS
+promise_channel[1].3.-1.PASS
+promise_channel[2].3.-1.PASS
+[if!(promise_received < quorums])]
+[if(promise_received >= quorums])]
+reset_promise_count
+[if![global_terminate]]
+promise_phase_ends ----------------------------------------------------------- promise phase ends
+[if[[global_accepted_value == -(1))] ----------------------------------------- there will be two option, select the first one
+proposer_did_not_fail_when_sending_accept ------------------------------------ if proposer did not fail when sending the accept messages, we need to let the model know
+accept_channel[0].PASS,2.123.PASS
+accepted_channel_learner[0].-1.NACK
+accepted_channel_learner[1].-1.NACK
+accepted_channel_proposer.-1.NACK
+accept_channel[1].PASS,2.123.PASS
+accepted_channel_learner[0].-1.NACK
+accepted_channel_learner[1].-1.NACK
+accepted_channel_proposer.-1.NACK
+accept_channel[2].PASS.2.123.PASS
+accepted_channel_learner[1].-1.NACK
+[if[[client_consensus == -[1])]
+accepted_channel_learner[0].-1.NACK
+[if[[client_consensus == -{1])]
+accepted_channel_proposer.-1.NACK
+end_of_broadcast ------------------------------------------------------------- acceptors finish broadcasting
+[if! global_terminate]]
+[if[retry]]
+reset[0].1.FAIL
+reset[1].1.FAIL
+reset[2].1.FAIL
+[if[[global_id>=2)]]
+[if!((global_id >= 4)]
+prepare_channel[0].1.4.PASS
+prepare_channel[1].1.4.PASS
+prepare_channel[2].1.4.PASS
+[if![[prepare_reads < quorums])]
+[if([prepare_reads >= quorums])]
+prepare_ends ----------------------------------------------------------------- prepare phase ends
+[i!!(((acceptor_prepare_status[0] == FAIL) || (acceptor_status[0] == FAIL)
+[i!![[[acceptor_prepare_status[1] == FAIL) || (acceptor_status[1] == FAIL]
+[i!!(((acceptor_prepare_status[2] == FAIL) || (acceptor_status[2] == FAIL)
+promise_channel[0].4.-1.PASS
+promise_channel[1].4.-1.PASS
+promise_channel[2].4.-1.PASS
+[if!((promise_received < quorums])]
+[if([promise_received >= quorums])]
+reset_promise_count
+[if! (global_terminate]]
+promise_phase_ends ----------------------------------------------------------- promise phase ends
+[if[[global_accepted_value == -(1)])]
+proposer_did_not_fail_when_sending_accept ------------------------------------ if proposer did not fail when sending the accept messages, we need to let the model know
+accept_channel[0].PASS,3.123.PASS -------------------------------------------- proposer 0 sends accept with value 3 but receives NACK
+accepted_channel_learner[0].-1.NACK
+accepted_channel_learner[1].-1.NACK
+accepted_channel_proposer.-1.NACK -------------------------------------------- there will be two on screen, please make sure to click the second one
+accept_channel[1].PASS.3.123.PASS
+accepted_channel_learner[0].-1.NACK
+accepted_channel_learner[1].-1.NACK
+accepted_channel_proposer.-1.NACK -------------------------------------------- there will be two on screen, please make sure to click the second one
+accept_channel[2].PASS.3.123.PASS 
+accepted_channel_learner[1].-1.NACK
+accepted_channel_learner[0].-1.NACK
+[if[[client_consensus == -(1)])]
+[if[[client_consensus == -(1)])]
+accepted_channel_proposer.-1.NACK --------------------------------------------- and so on ....
+
+// Scenario 5 - multiple Proposers conflict
+init
+start
+[if((global_elected_leader == 0])]  ------------------------------------------ checks if proposer is elected
+client_proposer.123 ---------------------------------------------------------- client proposed value 123
+[if![(global_id >=1]]
+prepare_channel[0].0.1.PASS -------------------------------------------------- proposer 0 send over prepare message with value 1 
+prepare_channel[1].0.1.PASS
+prepare_channel[2].0.1.PASS
+[if!((prepare_reads < quorums])]
+[if(prepare_reads >= quorums])]
+prepare_ends ----------------------------------------------------------------- prepare phase ends
+[if!(((acceptor_prepare_status[0] == FAIL) || (acceptor_status[0] == FAIL)
+[if![[[(acceptor_prepare_status[1] == FAIL) || (acceptor_status[1] == FAIL
+[if!(((acceptor_prepare_status[2] == FAIL) || (acceptor_status[2] == FAIL]
+promise_channel[0].1.-1.PASS ------------------------------------------------- acceptors send over promise message with value 1
+promise_channel[1].1.-1.PASS
+promise_channel[2].1.-1.PASS
+[if!(promise_received < quorums])]
+[if((promise_received >= quorums])]
+reset_promise_count
+[if!global_terminate]]
+promise_phase_ends ----------------------------------------------------------- promise phase ends
+[if[[global_accepted_value == -(1))]
+accept_channel[0].PASS.1.123.PASS -------------------------------------------- acceptor accepts the first value 
+proposer_fails --------------------------------------------------------------- proposer fails, all subsequent accept messages will fail as well (and accepted messages will NACK)
+accepted_channel_learner[0].123.PASS ----------------------------------------- acceptor broadcast accepted message to learner 1, learner 2 and proposer
+accepted_channel_learner[1].123.PASS
+accepted_channel_proposer.123.PASS
+accept_channel[1].FAIL.1.123.PASS
+accept_channel[2].FAIL.1.123.PASS  ------------------------------------------- accept message failed
+accepted_channel_learner[0].1.NACK
+accepted_channel_learner[1].1.NACK
+accepted_channel_proposer.-1.NACK
+accepted_channel_learner[0].1.NACK
+[if![[client_consensus == -(1)])
+reset_learner ---------------------------------------------------------------- reset learner so that it can receives the next message
+accepted_channel_learner[1].-1.NACK
+[if![(client_consensus == -{1)])
+reset_learner ---------------------------------------------------------------- reset learner so that it can receives the next message
+accepted_channel_proposer.-1.NACK
+end_of_broadcast ------------------------------------------------------------- acceptors finish broadcasting
+[if[global_terminate]]
+[if((0 == 0)]
+reset[0].1.FAIL
+reset[1].1.FAIL
+reset[2].1.FAIL
+elect_new_leader ------------------------------------------------------------- new leader elected, all acceptor states reset
+propose_new_value
+start
+[if[[global_elected_leader ==1])]
+client_proposer 124
+[if!((global_id>=2)]]
+prepare_channel[0].1.2.FAIL -------------------------------------------------- prepare message did not reach acceptor 0
+prepare_channel[1].1.2.PASS
+prepare_channel[2].1.2.PASS
+[if![[prepare_reads < quorums)]
+[if((prepare_reads >= quorums)]]
+prepare_ends ----------------------------------------------------------------- prepare phase ends
+[if{{{{acceptor_prepare_status[0] == FAIL) || (acceptor_status[0] == FAIL)
+[if![[[[acceptor_prepare_status[1] == FAIL) | (acceptor_status[1] == FAIL)
+[if![[[[acceptor_prepare_status[2] == FAIL) || (acceptor_status[2] == FAIL
+promise_channel[0].1.123.INACTIVE  ------------------------------------------- promise here is inactive since prepare was not received
+promise_channel[1].2.-1.PASS
+promise_channel[2].2.-1.PASS
+[if![promise_received < quorums])]
+[if((promise_received >= quorums)]]
+reset_promise_count
+[if![global_terminate]]
+promise_phase_ends ----------------------------------------------------------- promise phase ends
+[if[[global_accepted_value == -(1))]
+accept_channel[0].PASS,2.124.PASS -------------------------------------------- acceptor accepts the second value 
+accepted_channel_learner[1].124.PASS
+accepted_channel_learner[0].124.PASS
+accept_channel[1].PASS,2.124.PASS
+accepted_channel_learner[0].124.PASS
+accepted_channel_learner[1].124.PASS
+accepted_channel_proposer.124.PASS
+accepted_channel_proposer.124.PASS
+accept_channel[2].PASS.2.124.PASS
+accepted_channel_learner[0].124.PASS
+accepted_channel_learner[1].124.PASS
+[if![[client_consensus == -[1])]
+learner_client.0.124 --------------------------------------------------------- final read value is 124 (V2) 
+[if![(client_consensus == -(1))]
+learner_client.1.124
+finish
+proposer_did_not_fail_when_sending_accept ------------------------------------ if proposer did not fail when sending the accept messages, we need to let the model know
+accepted_channel_proposer.124.PASS
+end_of_broadcast ------------------------------------------------------------- acceptors finish broadcasting
+[if![global_terminate]]
+[if![retry]]
+
+// Scenario 6 Trace -  multi-identifier majority is insufficient
+init
+start
+[if((global_elected_leader == 0])]  ------------------------------------------ checks if proposer is elected
+client_proposer.123 ---------------------------------------------------------- client proposed value 123
+[if![(global_id >=1]]
+prepare_channel[0].0.1.PASS -------------------------------------------------- proposer 0 send over prepare message with value 1 
+prepare_channel[1].0.1.PASS
+prepare_channel[2].0.1.PASS
+prepare_channel[3].0.1.PASS
+prepare_channel[4].0.1.PASS
+[if!((prepare_reads < quorums)]
+[if[[prepare_reads >= quorums])]
+prepare_ends ----------------------------------------------------------------- prepare phase ends
+[if![[[(acceptor_prepare_status[0] == FAIL) || (acceptor_status[0] == FAIL
+[if!(((acceptor_prepare_status[1] == FAIL) || (acceptor_status[1] == FAIL)
+[if![[[(acceptor_prepare_status[2] == FAIL) || (acceptor_status[2] == FAIL
+[if![[[[acceptor_prepare_status[3] == FAIL) || (acceptor_status[3] == FAIL
+[if![[[(acceptor_prepare_status[4] == FAIL) || (acceptor_status[4] == FAIL
+promise_channel[0].1.-1.PASS ------------------------------------------------- acceptors send over promise message with value 1
+promise_channel[1].1.-1.PASS
+promise_channel[2].1.-1.PASS
+promise_channel[3].1.-1.PASS
+promise_channel[4].1.-1.PASS
+[if!(promise_received < quorums)]]
+[if(promise_received >= quorums])]
+reset_promise_count
+[if!global_terminate]]
+promise_phase_ends ----------------------------------------------------------- promise phase ends
+[if[[global_accepted_value == -(1)])]
+accept_channel[0].PASS.1.123.PASS
+accepted_channel_learner[0].123.PASS ----------------------------------------- acceptor broadcast accepted message to learner 1, learner 2 and proposer
+accepted_channel_learner[1].123.PASS
+accepted_channel_proposer 123.PASS
+proposer_fails --------------------------------------------------------------- proposer fails, all subsequent accept messages will fail as well (and accepted messages will NACK)
+accept_channel[1].FAIL.1.123.PASS
+accept_channel[2].FAIL.1.123.PASS  ------------------------------------------- accept message failed
+accept_channel[3].FAIL.1.123.PASS
+accept_channel[4].FAIL.1.123.PASS
+accepted_channel_learner[0].-1.NACK
+accepted_channel_learner[1].-1.NACK
+accepted_channel_proposer.-1.NACK
+accepted_channel_learner[0].-1.NACK
+accepted_channel_learner[1].-1.NACK
+accepted_channel_proposer.-1.NACK
+accepted_channel_learner[0].-1.NACK
+accepted_channel_learner[1].-1.NACK
+accepted_channel_proposer.-1.NACK
+accepted_channel_learner[0].-1.NACK
+[if![[client_consensus == -(1))]
+reset_learner ---------------------------------------------------------------- reset learner so that it can receives the next message
+accepted_channel_learner[1].-1.NACK
+[if![[client_consensus == -(1))]
+reset_learner ---------------------------------------------------------------- reset learner so that it can receives the next message
+accepted_channel_proposer.-1.NACK
+end_of_broadcast ------------------------------------------------------------- acceptors finish broadcasting
+[if[global_terminate]]
+[if((0== 0)]
+reset[0].1.FAIL
+reset[1].1.FAIL
+reset[2].1.FAIL
+reset[3].1.FAIL
+reset[4].1.FAIL
+elect_new_leader ------------------------------------------------------------- new leader elected, all acceptor states reset
+propose_new_value
+[if[[global_elected_leader==1])]
+client_proposer.124
+[if!((global_id>=2)]]
+prepare_channel[0].1.2.FAIL -------------------------------------------------- prepare message did not reach acceptor 0
+prepare_channel[1].1.2.PASS -------------------------------------------------- proposer 1 sends a prepare message with value 2
+prepare_channel[2].1.2.PASS
+prepare_channel[3].1.2.PASS
+prepare_channel[4].1.2.PASS
+[if!((prepare_reads < quorums])]
+[if[[prepare_reads >= quorums])]
+prepare_ends ----------------------------------------------------------------- prepare phase ends
+[if[[[[acceptor_prepare_status[0] == FAIL) || (acceptor_status[0] == FAIL)
+[if!(((acceptor_prepare_status[1] == FAIL) || (acceptor_status[1] == FAIL)
+[i!![[[(acceptor_prepare_status[2] == FAIL) || (acceptor_status[2] == FAIL
+[i!![[[acceptor_prepare_status[3] == FAIL) || (acceptor_status[3] == FAIL)
+[i!![[[[acceptor_prepare_status[4] == FAIL) || (acceptor_status[4] == FAIL
+promise_channel[0].1.123.INACTIVE  ------------------------------------------- promise here is inactive since prepare was not received
+promise_channel[1].2.-1.PASS
+promise_channel[2].2.-1.PASS
+promise_channel[3].2.-1.PASS
+promise_channel[4].2.-1.PASS
+[if!((promise_received < quorums])]
+[if((promise_received >= quorums])]
+reset_promise_count
+[if![global_terminate]]
+promise_phase_ends ----------------------------------------------------------- promise phase ends
+[if[[global_accepted_value == -(1)])]
+accept_channel[1].PASS,2.124.PASS
+accepted_channel_learner[0].124.PASS
+accepted_channel_learner[1].124.PASS
+accepted_channel_proposer 124.PASS
+proposer_fails --------------------------------------------------------------- proposer fails, all subsequent accept messages will fail as well (and accepted messages will NACK)
+accept_channel[0].FAIL.2.124.PASS
+accepted_channel_learner[0].123.NACK
+accepted_channel_learner[1].123.NACK
+accept_channel[2].FAIL.2.124.PASS
+accepted_channel_learner[0].-1.NACK
+accepted_channel_learner[1].-1.NACK
+accepted_channel_proposer.123.NACK
+accepted_channel_proposer.-1.NACK
+accept_channel[4].FAIL.2.124.PASS
+accepted_channel_learner[0].-1.NACK
+accepted_channel_learner[1].-1.NACK
+accept_channel[3].FAIL.2.124.PASS
+accepted_channel_learner[0].-1.NACK
+accepted_channel_learner[1].-1.NACK
+[if![[client_consensus == -{1])]
+reset_learner ---------------------------------------------------------------- reset learner so that it can receives the next message
+[if![[client_consensus == -{1])]
+reset_learner ---------------------------------------------------------------- reset learner so that it can receives the next message
+accepted_channel_proposer.-1.NACK
+accepted_channel_proposer.-1.NACK
+end_of_broadcast ------------------------------------------------------------- acceptors finish broadcasting
+[if[global_terminate]]
+[if!(1 == 0)]
+[if!(1 == (PROPOSERS - 1])]
+[if(((0<1) & (1<(PROPOSERS - 1])]
+reset[0].2.FAIL
+reset[1].2.FAIL
+reset[2].2.FAIL
+reset[3].2.FAIL
+reset[4].2.FAIL
+elect_new_leader ------------------------------------------------------------- new leader elected, all acceptor states reset
+start
+[if[[global_elected_leader == 2])]
+client_does_not_propose_value
+[if![[global_id>=3)]]
+prepare_channel[0].2.3.PASS -------------------------------------------------- proposer 2 sends a prepare message with value 3
+prepare_channel[1].2.3.FAIL
+prepare_channel[2].2.3.PASS
+prepare_channel[3].2.3.PASS
+prepare_channel[4].2.3.PASS
+[if!((prepare_reads < quorums])]
+[if((prepare_reads>= quorums])]
+prepare_ends ----------------------------------------------------------------- prepare phase ends
+[if![[[(acceptor_prepare_status[0] == FAIL) ll (acceptor_status[0] == FAIL
+[if![[[(acceptor_prepare_status[1] == FAIL) ll (acceptor_status[1] == FAIL)
+[if![[[(acceptor_prepare_status[2] == FAIL) ll (acceptor_status[2] == FAIL
+[if![[((acceptor_prepare_status[3] == FAIL) ll (acceptor_status[3] == FAIL
+[if![[[(acceptor_prepare_status[4] == FAIL) ll (acceptor_status[4] == FAIL
+promise_channel[0].3.123.PASS
+promise_channel[1].2.124.INACTIVE
+promise_channel[2].3.-1.PASS
+promise_channel[3].3.-1.PASS
+promise_channel[4].3.-1.PASS
+[if!(promise_received < quorums])]
+[if((promise_received >= quorums])]
+reset_promise_count
+[if![global_terminate]]
+promise_phase_ends ----------------------------------------------------------- promise phase ends
+[if![[[global_accepted_value = -(1)])]
+accept_channel[2].PASS,3.123.PASS
+accepted_channel_learner[0].123.PASS ----------------------------------------- acceptor broadcast accepted message to learner 1, learner 2 and proposer
+accepted_channel_learner[1].123.PASS
+accepted_channel_proposer 123.PASS
+accept_channel[3].PASS.3.123.PASS
+accepted_channel_learner[0].123.PASS ----------------------------------------- acceptor broadcast accepted message to learner 1, learner 2 and proposer
+accepted_channel_learner[1].123.PASS
+accepted_channel_proposer.123.PASS
+proposer_fails --------------------------------------------------------------- proposer fails, all subsequent accept messages will fail as well (and accepted messages will NACK)
+accept_channel[0].FAIL.3.123.PASS
+accepted_channel_learner[0].123.NACK
+accepted_channel_learner[1].123.NACK
+accepted_channel_proposer.123.NACK
+accept_channel[1].FAIL.3.123.PASS
+accepted_channel_learner[0].124.NACK
+accepted_channel_learner[1].124.NACK
+accepted_channel_proposer 124.NACK
+accept_channel[4].FAIL.3.123.PASS
+accepted_channel_learner[1].-1.NACK
+accepted_channel_learner[0].-1.NACK
+[if![[client_consensus == -(1)])
+reset_learner ---------------------------------------------------------------- reset learner so that it can receives the next message
+[if![(client_consensus == -(1)])
+reset_learner ---------------------------------------------------------------- reset learner so that it can receives the next message
+accepted_channel_proposer.-1.NACK
+end_of_broadcast ------------------------------------------------------------- acceptors finish broadcasting
+[if[global_terminate]]
+[if!((2==0)]]
+[if!((2 == (PROPOSERS - 1])]
+[if(((0<2) & (2< (PROPOSERS - 1])]
+reset[0].3.FAIL
+reset[1].3.FAIL
+reset[2].3.FAIL
+reset[3].3.FAIL
+reset[4].3.FAIL
+elect_new_leader ------------------------------------------------------------- new leader elected, all acceptor states reset
+start
+[if[[global_elected_leader == 3])]
+client_does_not_propose_value
+[if![[global_id>= 4)]]
+prepare_channel[0].3.4.PASS -------------------------------------------------- proposer 3 sends a prepare message with value 4
+prepare_channel[1].3.4.PASS
+prepare_channel[2].3.4.FAIL
+prepare_channel[3].3.4.FAIL
+prepare_channel[4].3.4.PASS
+[if!((prepare_reads < quorums)]
+[if[[prepare_reads >= quorums])]
+prepare_ends ----------------------------------------------------------------- prepare phase ends
+[i!![[[acceptor_prepare_status[0] == FAIL) II (acceptor_status[0] == FAIL)
+[i!![[[acceptor_prepare_status[1] == FAIL) II (acceptor_status[1] == FAIL)
+[if[[[[acceptor_prepare_status[2] == FAIL) || (acceptor_status[2] == FAIL)
+[if[[[[acceptor_prepare_status[3] == FAIL) || (acceptor_status[3] == FAIL)
+[i!![[[[acceptor_prepare_status[4] == FAIL) || (acceptor_status[4] == FAIL
+promise_channel[0].4.123.PASS
+promise_channel[1].4.124.PASS
+promise_channel[2].3.123.INACTIVE
+promise_channel[3].3.123.INACTIVE
+promise_channel[4].4.-1.PASS
+[if![[promise_received < quorums])]
+[if((promise_received >= quorums])]
+reset_promise_count
+[if![global_terminate]]
+promise_phase_ends ----------------------------------------------------------- promise phase ends
+[if![[global accepted_value == -(1)])]
+proposer_did_not_fail_when_sending_accept ------------------------------------ if proposer did not fail when sending the accept messages, we need to let the model know
+accept_channel[0].PASS.4.124.PASS
+accepted_channel_learner[0].124.PASS
+accepted_channel_learner[1].124.PASS
+accepted_channel_proposer.124.PASS
+accept_channel[1].PASS,4124.PASS
+accepted_channel_learner[0].124.PASS
+accepted_channel_learner[1].124.PASS
+accepted_channel_proposer.124.PASS
+accept_channel[2].PASS,4,124.PASS
+accepted_channel_learner[0].124.PASS
+accepted_channel_learner[1].124.PASS
+accepted_channel_proposer 124.PASS
+accept_channel[3].PASS,4.124.PASS
+accepted_channel_learner[0].124.PASS
+accepted_channel_learner[1].124.PASS
+accepted_channel_proposer 124.PASS
+accept_channel[4].PASS.4.124.PASS
+accepted_channel_learner[1].124.PASS
+accepted_channel_learner[0].124.PASS
+[if![[client_consensus == -(1)])]
+learner_client.0.124 --------------------------------------------------------- V2 is the final read value 
+[if![[client_consensus == -(1)])]
+learner_client.1.124
+finish
+accepted_channel_proposer 124.PASS
+end_of_broadcast ------------------------------------------------------------- acceptors finish broadcasting
+[if![global_terminate]]
+[if![retry]]
+
+// Scenario 7 Trace - existing consensus
+init
+start
+[if((global_elected_leader == 0])]  ------------------------------------------ checks if proposer is elected
+client_proposer.123 ---------------------------------------------------------- client proposed value 123
+[if![(global_id >=1]]
+prepare_channel[0].0.1.PASS -------------------------------------------------- proposer 0 send over prepare message with value 1 
+prepare_channel[1].0.1.PASS
+prepare_channel[2].0.1.PASS
+[if!((prepare_reads < quorums])]
+[if(prepare_reads >= quorums])]
+prepare_ends ----------------------------------------------------------------- prepare phase ends
+[if![[[(acceptor_prepare_status[0] == FAIL) || (acceptor_status[0] == FAIL
+[if![[[(acceptor_prepare_status[1] == FAIL) || (acceptor_status[1] == FAIL
+[if![[[[[acceptor_prepare_status[2] == FAIL) || (acceptor_status[2] == FAI
+promise_channel[0].1.-1.PASS ------------------------------------------------- acceptors send over promise message with value 1
+promise_channel[1].1.-1.PASS
+promise_channel[2].1.-1.PASS
+[if!(promise_received < quorums])]
+[if((promise_received >= quorums])]
+reset_promise_count
+[if![global_terminate]]
+promise_phase_ends ----------------------------------------------------------- promise phase ends
+[if([global_accepted_value == -(1))]
+accept_channel[0].PASS.1.123.PASS
+accept_channel[1].PASS.1.123.PASS
+proposer_fails --------------------------------------------------------------- proposer fails, all subsequent accept messages will fail as well (and accepted messages will NACK)
+accept_channel[2].FAIL.1.123.PASS  ------------------------------------------- accept message failed
+accepted_channel_learner[0].123.PASS ----------------------------------------- acceptor broadcast accepted message to learner 1, learner 2 and proposer
+accepted_channel_learner[1].123.PASS
+accepted_channel_proposer.123.PASS
+accepted_channel_learner[0].123.PASS ----------------------------------------- acceptor broadcast accepted message to learner 1, learner 2 and proposer
+accepted_channel_learner[1].123.PASS
+accepted_channel_proposer 123.PASS
+accepted_channel_learner[0].-1.NACK
+[if![(client_consensus == -(1)])]
+reset_learner ---------------------------------------------------------------- reset learner so that it can receives the next message
+accepted_channel_learner[1].-1.NACK
+[if!((client_consensus == -(1)])]
+reset_learner ---------------------------------------------------------------- reset learner so that it can receives the next message
+accepted_channel_proposer.-1.NACK
+end_of_broadcast ------------------------------------------------------------- acceptors finish broadcasting
+[if[global_terminate]]
+[if((0== 0])]
+reset[1].1.FAIL
+reset[0].1.FAIL
+reset[2].1.FAIL
+elect_new_leader ------------------------------------------------------------- new leader elected, all acceptor states reset
+start
+[if[[global_elected_leader == 1 )]
+client_does_not_propose_value
+[if!((global_id >= 2)]
+prepare_channel[0].1.2.FAIL -------------------------------------------------- prepare message did not reach acceptor 0
+prepare_channel[1].1.2.PASS
+prepare_channel[2].1.2.PASS
+[if!((prepare_reads < quorums])]
+[if((prepare_reads >= quorums])]
+prepare_ends ----------------------------------------------------------------- prepare phase ends
+[if[[[acceptor_prepare_status[0] == FAIL) || (acceptor_status[0] == FAIL)]
+[if![[[(acceptor_prepare_status[1] == FAIL) || (acceptor_status[1] == FAIL
+[i!![[[[acceptor_prepare_status[2] == FAIL) || (acceptor_status[2] == FAIL
+promise_channel[0].1.123.INACTIVE  ------------------------------------------- promise here is inactive since prepare was not received
+promise_channel[1].2.123.PASS
+promise_channel[2].2.-1.PASS
+[if!(promise_received < quorums])]
+[if((promise_received >= quorums])]
+reset_promise_count
+[if![global_terminate]]
+promise_phase_ends ----------------------------------------------------------- promise phase ends
+[if![[global_accepted_value == (1))]
+proposer_did_not_fail_when_sending_accept ------------------------------------ if proposer did not fail when sending the accept messages, we need to let the model know
+accept_channel[0].PASS.2.123.PASS
+accepted_channel_learner[0].123.PASS ----------------------------------------- acceptor broadcast accepted message to learner 1, learner 2 and proposer
+accepted_channel_learner[1].123.PASS
+accepted_channel_proposer.123.PASS
+accept_channel[1].PASS.2.123.PASS
+accepted_channel_learner[1].123.PASS
+accepted_channel_learner[0].123.PASS ----------------------------------------- acceptor broadcast accepted message to learner 1, learner 2 and proposer
+accepted_channel_proposer.123.PASS
+accept_channel[2].PASS,2.123.PASS
+accepted_channel_learner[0].123.PASS ----------------------------------------- acceptor broadcast accepted message to learner 1, learner 2 and proposer
+accepted_channel_learner[1].123.PASS
+[if![[client_consensus == -(1)])]
+learner_client.1.123 --------------------------------------------------------- V1 value is read
+[if![[client_consensus == -(1)])]
+learner_client.1.123 --------------------------------------------------------- learner received all the accepted messages and sends it to client
+finish
+accepted_channel_proposer.123.PASS
+end_of_broadcast ------------------------------------------------------------- acceptors finish broadcasting
+[if![global_terminate]]
+[if![retry)]
+**/
